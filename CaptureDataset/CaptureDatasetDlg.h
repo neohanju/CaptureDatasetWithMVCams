@@ -54,4 +54,5 @@ private:
 	int     m_MVOpenCVDataType;
 	DeviceManager m_cMVDeviceManager;
 	clock_t m_timeStart;
+	int test;
 };
