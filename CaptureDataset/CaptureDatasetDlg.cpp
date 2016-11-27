@@ -7,24 +7,139 @@
 #include "CaptureDatasetDlg.h"
 #include "afxdialogex.h"
 #include <thread>
+#include <math.h>
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
 #endif
 
-#define SAVE_PATH "D:/Workspace/Dataset/Record_MVCam"
+bool pairCompare(const std::pair<double, double>& firstElem, const std::pair<double, double>& secondElem) 
+{
+	return firstElem.first < secondElem.first;
+}
+
+//-----------------------------------------------------------------------------
+#define SAVE_PATH          ("D:/Workspace/Dataset/Record_MVCam")
+#define LIDAR_COM_BAUDRATE (115200)
+#define LIDAR_SPEED        (400)
+#define LIDAR_MAP_SIZE     (700)
+const size_t LIDAR_RESOLUTION = 360 * 2;
+const double LIDAR_RESCALE = (double)LIDAR_MAP_SIZE / 1400.0;
+const char *strLidarComPath[] = { "\\\\.\\com3", "\\\\.\\com8" };
+//-----------------------------------------------------------------------------
 
 using namespace mvIMPACT::acquire;
+using namespace rp::standalone::rplidar;
 
 static volatile int  gNumGrabbing = 0;
-static volatile bool gCameraGrabbing[NUM_CAMERAS] = { true, true };
-static cv::Mat       gMatFrames[NUM_CAMERAS];
-static SRWLOCK       gSRWLock[NUM_CAMERAS];
+static volatile bool gCameraGrabbing[MAX_NUM_CAMERAS];
+static cv::Mat       gMatFrames[MAX_NUM_CAMERAS];
+static SRWLOCK       gSRWLock[MAX_NUM_CAMERAS];
+
+static volatile int  gNumLidarGrabbing = 0;
+static volatile bool gLidarGrabbing[MAX_NUM_LIDARS];
+static SRWLOCK       gSRWLidarLock[MAX_NUM_LIDARS];
 
 //-----------------------------------------------------------------------------
+inline bool checkRPLIDARHealth(RPlidarDriver * drv)
+{
+	u_result     op_result;
+	rplidar_response_device_health_t healthinfo;
+
+	op_result = drv->getHealth(healthinfo);
+	if (IS_OK(op_result)) { // the macro IS_OK is the preperred way to judge whether the operation is succeed.
+		printf("RPLidar health status : %d\n", healthinfo.status);
+		if (healthinfo.status == RPLIDAR_STATUS_ERROR) {
+			fprintf(stderr, "Error, rplidar internal error detected. Please reboot the device to retry.\n");
+			// enable the following code if you want rplidar to be reboot by software
+			// drv->reset();
+			return false;
+		}
+		else {
+			return true;
+		}
+
+	}
+	else {
+		fprintf(stderr, "Error, cannot retrieve the lidar health code: %x\n", op_result);
+		return false;
+	}
+}
+
+
+struct LidarParameter
+{
+	LidarParameter(int _threadID, RPlidarDriver* _p, std::vector<std::pair<double, double>> *_nodes)
+		: nThreadID(_threadID)
+		, pDriver(_p)
+		, nodes(_nodes)
+	{}
+	~LidarParameter() {}
+
+	int            nThreadID;
+	RPlidarDriver* pDriver;
+	std::vector<std::pair<double, double>> *nodes; // angle / distance
+};
+static LidarParameter* stPLidarParams[MAX_NUM_LIDARS];
+
+
+//-----------------------------------------------------------------------------
+unsigned int __stdcall LidarCaptureThread(void* pData)
+//-----------------------------------------------------------------------------
+{
+	LidarParameter* pParam = (LidarParameter*)pData;
+	u_result op_result;
+
+	while (gLidarGrabbing[pParam->nThreadID])
+	{
+		rplidar_response_measurement_node_t nodes[LIDAR_RESOLUTION];
+		size_t count = _countof(nodes);
+		op_result = pParam->pDriver->grabScanData(nodes, count);
+
+		if (IS_FAIL(op_result)) 
+		{
+			printf("there is problem to grabbing lidar sensor data\n");
+			continue;
+		}
+
+		pParam->pDriver->ascendScanData(nodes, count);
+		for (int pos = 0; pos < (int)count; ++pos)
+		{
+			printf("%s theta: %03.2f Dist: %08.2f Q: %d \n",
+				(nodes[pos].sync_quality & RPLIDAR_RESP_MEASUREMENT_SYNCBIT) ? "S " : "  ",
+				(nodes[pos].angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT) / 64.0f,
+				nodes[pos].distance_q2 / 4.0f,
+				nodes[pos].sync_quality >> RPLIDAR_RESP_MEASUREMENT_QUALITY_SHIFT);
+		}
+
+		AcquireSRWLockExclusive(&gSRWLidarLock[pParam->nThreadID]);
+		for (int pos = 0; pos < LIDAR_RESOLUTION; ++pos)
+		{
+			if (pos < (int)count)
+			{
+				(*pParam->nodes)[pos].first = (nodes[pos].angle_q6_checkbit >> RPLIDAR_RESP_MEASUREMENT_ANGLE_SHIFT) / 64.0f;
+				(*pParam->nodes)[pos].second = nodes[pos].distance_q2 / 4.0f;
+			}
+			else
+			{
+				(*pParam->nodes)[pos].first  = -1.0;
+				(*pParam->nodes)[pos].second = 0.0;
+			}
+		}
+		ReleaseSRWLockExclusive(&gSRWLidarLock[pParam->nThreadID]);
+	}
+
+	pParam->pDriver->stop();
+	pParam->pDriver->stopMotor();
+	RPlidarDriver::DisposeDriver(pParam->pDriver);
+
+	return 0;
+}
+//-----------------------------------------------------------------------------
+
+
 // Start the acquisition manually if this was requested(this is to prepare the driver for data capture and tell the device to start streaming data)
 inline void manuallyStartAcquisitionIfNeeded(mvIMPACT::acquire::Device* pDev, const mvIMPACT::acquire::FunctionInterface& fi)
-//-----------------------------------------------------------------------------
 {
 	if (pDev->acquisitionStartStopBehaviour.read() == mvIMPACT::acquire::assbUser)
 	{
@@ -37,10 +152,9 @@ inline void manuallyStartAcquisitionIfNeeded(mvIMPACT::acquire::Device* pDev, co
 	}
 }
 
-//-----------------------------------------------------------------------------
+
 // Stop the acquisition manually if this was requested
 inline void manuallyStopAcquisitionIfNeeded(mvIMPACT::acquire::Device* pDev, const mvIMPACT::acquire::FunctionInterface& fi)
-//-----------------------------------------------------------------------------
 {
 	if (pDev->acquisitionStartStopBehaviour.read() == mvIMPACT::acquire::assbUser)
 	{
@@ -66,9 +180,12 @@ struct CaptureParameter
 	Device*                 pDev;
 	cv::Mat*                pBuffer;	
 };
-static CaptureParameter* stPCaptureParams[NUM_CAMERAS] = { NULL, NULL };
+static CaptureParameter* stPCaptureParams[MAX_NUM_CAMERAS];
 
+
+//-----------------------------------------------------------------------------
 unsigned int __stdcall MVCaptureThread(void* pData)
+//-----------------------------------------------------------------------------
 {
 	CaptureParameter* pParam = reinterpret_cast<CaptureParameter*>(pData);
 
@@ -188,6 +305,7 @@ unsigned int __stdcall MVCaptureThread(void* pData)
 				      << requestNr << ", " << ImpactAcquireException::getErrorCodeAsString(requestNr) << ")"
 				      << ", timeout value too small?" << std::endl;
 		}
+		::Sleep(10);
 	}
 	manuallyStopAcquisitionIfNeeded(pParam->pDev, fi);
 
@@ -207,6 +325,7 @@ unsigned int __stdcall MVCaptureThread(void* pData)
 
 	return 0;
 }
+//-----------------------------------------------------------------------------
 
 
 // CCaptureDatasetDlg dialog
@@ -251,9 +370,21 @@ BOOL CCaptureDatasetDlg::OnInitDialog()
 
 	m_bRecord = false;
 
+	for (int camIdx = 0; camIdx < MAX_NUM_CAMERAS; camIdx++)
+	{
+		gCameraGrabbing[camIdx] = true;
+		stPCaptureParams[camIdx] = NULL;
+	}
+
+	for (int lidarIdx = 0; lidarIdx < MAX_NUM_LIDARS; lidarIdx++)
+	{
+		gLidarGrabbing[lidarIdx] = true;
+		stPLidarParams[lidarIdx] = NULL;
+	}
+
 	//----------------------------MATRIX VISION-----------------------------//
 	gNumGrabbing = 0;
-	m_numMVCameras = m_cMVDeviceManager.deviceCount();
+	m_numMVCameras = (int)std::min(m_cMVDeviceManager.deviceCount(), (unsigned int)MAX_NUM_CAMERAS);
 	for (int camIdx = 0; camIdx < m_numMVCameras; camIdx++)
 	{
 		try
@@ -264,8 +395,98 @@ BOOL CCaptureDatasetDlg::OnInitDialog()
 			pDevice->open();
 			assert(NULL != pDevice);
 
+			//CameraSettingsBlueCOUGAR cameraSettings(pDevice);
+			//cameraSettings.restoreDefault();
+			//cameraSettings.autoExposeControl = aecOff;
+			//cameraSettings.autoGainControl = agcOff;
+			//cameraSettings.gain_dB = 0.0f;
+			//cameraSettings.frameRate_Hz = 20.0f;
+			//cameraSettings.expose_us = 50000;
+
 			stPCaptureParams[camIdx] = new CaptureParameter(camIdx, pDevice, &m_arrMatFrames[camIdx]);
-			m_hThread[camIdx] = (HANDLE)_beginthreadex(0, 0, MVCaptureThread, (LPVOID)(stPCaptureParams[camIdx]), 0, 0);
+			m_hCameraThread[camIdx] = (HANDLE)_beginthreadex(0, 0, MVCaptureThread, (LPVOID)(stPCaptureParams[camIdx]), 0, 0);
+		}
+		catch (mvIMPACT::acquire::ImpactAcquireException &e)
+		{
+			// this e.g. might happen if the same device is already opened in another process...
+			printf("[ERROR] An error occurred while opening the device (error code: %d)\n",
+				e.getErrorCode());
+		}
+
+		// for visualization
+		m_arrMfcCameraImages[camIdx] = NULL;
+	}
+	//----------------------------MATRIX VISION-----------------------------//
+
+
+	//-----------------------------RPLIDAR  A2------------------------------//
+	gNumLidarGrabbing = 0;
+	m_numLidars = MAX_NUM_LIDARS;
+	for (int lidarIdx = 0; lidarIdx < m_numLidars; lidarIdx++)
+	{
+		try
+		{
+			u_result op_result;
+			RPlidarDriver *drv = RPlidarDriver::CreateDriver(RPlidarDriver::DRIVER_TYPE_SERIALPORT);
+
+			if (!drv) 
+			{
+				fprintf(stderr, "insufficent memory, exit\n");
+				exit(-2);
+			}
+
+			// make connection...
+			if (IS_FAIL(drv->connect(strLidarComPath[lidarIdx], LIDAR_COM_BAUDRATE))) 
+			{
+				fprintf(stderr, "Error, cannot bind to the specified serial port %s.\n"
+					, strLidarComPath);
+				RPlidarDriver::DisposeDriver(drv);
+				continue;
+			}
+
+			rplidar_response_device_info_t devinfo;
+
+			// retrieving the device info
+			////////////////////////////////////////
+			op_result = drv->getDeviceInfo(devinfo);
+
+			if (IS_FAIL(op_result)) 
+			{
+				fprintf(stderr, "Error, cannot get device info.\n");
+				RPlidarDriver::DisposeDriver(drv);
+				continue;
+			}
+
+			// print out the device serial number, firmware and hardware version number..
+			printf("RPLIDAR S/N: ");
+			for (int pos = 0; pos < 16; ++pos) {
+				printf("%02X", devinfo.serialnum[pos]);
+			}
+
+			printf("\n"
+				"Firmware Ver: %d.%02d\n"
+				"Hardware Rev: %d\n"
+				, devinfo.firmware_version >> 8
+				, devinfo.firmware_version & 0xFF
+				, (int)devinfo.hardware_version);
+
+
+			// check health...
+			if (!checkRPLIDARHealth(drv)) 
+			{
+				RPlidarDriver::DisposeDriver(drv);
+				continue;
+			}
+
+			drv->startMotor();
+			drv->startScan();
+			drv->setMotorPWM((_u16)LIDAR_SPEED);
+
+			////////////////////
+			m_arrNodes[lidarIdx].resize(LIDAR_RESOLUTION, std::make_pair(0.0, 0.0));
+			m_arrNodesBuffer[lidarIdx].resize(LIDAR_RESOLUTION, std::make_pair(0.0, 0.0));
+			stPLidarParams[lidarIdx] = new LidarParameter(lidarIdx, drv, &m_arrNodes[lidarIdx]);
+			m_hLidarThread[lidarIdx] = (HANDLE)_beginthreadex(0, 0, LidarCaptureThread, (LPVOID)(stPLidarParams[lidarIdx]), 0, 0);
 		}
 		catch (mvIMPACT::acquire::ImpactAcquireException &e)
 		{
@@ -274,12 +495,10 @@ BOOL CCaptureDatasetDlg::OnInitDialog()
 				e.getErrorCode());
 		}
 	}
-	//----------------------------MATRIX VISION-----------------------------//
+	//-----------------------------RPLIDAR  A2------------------------------//
 
-	for (int imgIdx = 0; imgIdx < NUM_CAMERAS; imgIdx++)
-	{
-		m_arrMfcImages[imgIdx] = NULL;
-	}
+
+	/* start threads */
 	::Sleep(30);
 	m_bThreadRun = true;
 	SetTimer(1000, 30, NULL);
@@ -324,8 +543,8 @@ void CCaptureDatasetDlg::OnClose()
 	//	for (int camIdx = 0; camIdx < m_numMVCameras; camIdx++)
 	//	{
 	//		gCameraGrabbing[camIdx] = false;
-	//		WaitForSingleObject(m_hThread[camIdx], INFINITE);
-	//		CloseHandle(m_hThread[camIdx]);
+	//		WaitForSingleObject(m_hCameraThread[camIdx], INFINITE);
+	//		CloseHandle(m_hCameraThread[camIdx]);
 
 	//		if (NULL != stPCaptureParams[camIdx])
 	//		{
@@ -363,14 +582,14 @@ void CCaptureDatasetDlg::OnTimer(UINT_PTR nIDEvent)
 		/* display */
 		for (int camIdx = 0; camIdx < m_numMVCameras; camIdx++)
 		{			
+			AcquireSRWLockShared(&gSRWLock[camIdx]);
+			m_arrMatFrames[camIdx].copyTo(m_arrMatFrameBuffer[camIdx]);
+			ReleaseSRWLockShared(&gSRWLock[camIdx]);
+
 			RECT clientRect;
 			m_staticImage[camIdx].GetClientRect(&clientRect);
 			cv::Size rectSize(clientRect.right, clientRect.bottom);
 			cv::Mat  matResizedImage;
-
-			AcquireSRWLockShared(&gSRWLock[camIdx]);
-			m_arrMatFrames[camIdx].copyTo(m_arrMatFrameBuffer[camIdx]);
-			ReleaseSRWLockShared(&gSRWLock[camIdx]);
 
 			if (m_arrMatFrameBuffer[camIdx].empty()) { continue; }
 			cv::cvtColor(m_arrMatFrameBuffer[camIdx], matResizedImage, CV_BGRA2BGR);
@@ -378,14 +597,14 @@ void CCaptureDatasetDlg::OnTimer(UINT_PTR nIDEvent)
 			cv::resize(matResizedImage, matResizedImage, rectSize);			
 			cv::flip(matResizedImage, matResizedImage, 0);
 
-			if (m_arrMfcImages[camIdx])
+			if (m_arrMfcCameraImages[camIdx])
 			{
-				m_arrMfcImages[camIdx]->ReleaseDC();
-				delete m_arrMfcImages[camIdx];
-				m_arrMfcImages[camIdx] = nullptr;
+				m_arrMfcCameraImages[camIdx]->ReleaseDC();
+				delete m_arrMfcCameraImages[camIdx];
+				m_arrMfcCameraImages[camIdx] = nullptr;
 			}
-			m_arrMfcImages[camIdx] = new CImage();
-			m_arrMfcImages[camIdx]->Create(rectSize.width, rectSize.height, 24);
+			m_arrMfcCameraImages[camIdx] = new CImage();
+			m_arrMfcCameraImages[camIdx]->Create(rectSize.width, rectSize.height, 24);
 
 			BITMAPINFO bitInfo;
 			bitInfo.bmiHeader.biBitCount = 24;
@@ -400,16 +619,50 @@ void CCaptureDatasetDlg::OnTimer(UINT_PTR nIDEvent)
 			bitInfo.bmiHeader.biXPelsPerMeter = 0;
 			bitInfo.bmiHeader.biYPelsPerMeter = 0;
 
-			StretchDIBits(m_arrMfcImages[camIdx]->GetDC(), 0, 0,
+			StretchDIBits(m_arrMfcCameraImages[camIdx]->GetDC(), 0, 0,
 				rectSize.width, rectSize.height, 0, 0,
 				rectSize.width, rectSize.height,
 				matResizedImage.data, &bitInfo, DIB_RGB_COLORS, SRCCOPY
 			);
 
-			m_arrMfcImages[camIdx]->BitBlt(::GetDC(m_staticImage[camIdx].m_hWnd), 0, 0);
-			m_arrMfcImages[camIdx]->ReleaseDC();
-			delete m_arrMfcImages[camIdx];
-			m_arrMfcImages[camIdx] = nullptr;
+			m_arrMfcCameraImages[camIdx]->BitBlt(::GetDC(m_staticImage[camIdx].m_hWnd), 0, 0);
+			m_arrMfcCameraImages[camIdx]->ReleaseDC();
+			delete m_arrMfcCameraImages[camIdx];
+			m_arrMfcCameraImages[camIdx] = nullptr;
+		}
+
+		for (int lidarIdx = 0; lidarIdx < m_numLidars; lidarIdx++)
+		{
+			AcquireSRWLockShared(&gSRWLidarLock[lidarIdx]);
+			m_arrNodesBuffer[lidarIdx] = m_arrNodes[lidarIdx];
+			ReleaseSRWLockShared(&gSRWLidarLock[lidarIdx]);
+
+			//cv::Mat matLidar = cv::Mat::zeros((int)LIDAR_MAP_SIZE, (int)LIDAR_MAP_SIZE, CV_8UC3);
+			//std::vector<cv::Point2f> distancePoints;
+			//distancePoints.reserve(LIDAR_RESOLUTION);
+
+			//std::sort(m_arrNodesBuffer[lidarIdx].begin(), m_arrNodesBuffer[lidarIdx].end(), pairCompare);
+			//for (int pos = 0; pos < LIDAR_RESOLUTION; pos++)
+			//{
+			//	if (0 > m_arrNodesBuffer[lidarIdx][pos].first) { break;	}
+
+			//	double angle    = m_arrNodesBuffer[lidarIdx][pos].first;
+			//	double distance = m_arrNodesBuffer[lidarIdx][pos].second * LIDAR_RESCALE;
+			//	distancePoints.push_back(cv::Point2f(
+			//			distance * cos(angle) + (double)LIDAR_MAP_SIZE * 0.5,
+			//			distance * sin(angle) + (double)LIDAR_MAP_SIZE * 0.5));
+			//}
+
+			//if (0 == distancePoints.size()) { continue; }
+
+			//distancePoints.push_back(distancePoints.front());
+
+			//for (int pointIdx = 0; pointIdx < distancePoints.size() - 1; pointIdx++)
+			//{
+			//	cv::line(matLidar, distancePoints[pointIdx], distancePoints[pointIdx + 1], cv::Scalar(0, 255, 0));
+			//	int a = 0;
+			//}
+			//int b = 0;
 		}
 
 		/* file saving */
@@ -428,6 +681,39 @@ void CCaptureDatasetDlg::OnTimer(UINT_PTR nIDEvent)
 					cv::imwrite(strFileName, m_arrMatFrameBuffer[camIdx]);
 				}				
 			}
+
+			for (int sensorIdx = 0; sensorIdx < m_numLidars; sensorIdx++)
+			{
+				std::string strSavePath = std::string(SAVE_PATH) + "/" + "Lidar_00" + std::to_string(sensorIdx + 1);
+				std::wstring wideStrDirName = L"";
+				wideStrDirName.assign(strSavePath.begin(), strSavePath.end());
+				if (CreateDirectory(wideStrDirName.c_str(), NULL) || ERROR_ALREADY_EXISTS == GetLastError())
+				{
+					char strFileName[100];
+					sprintf_s(strFileName, "%s/frame_%02d%02d%02d%02d%02d%03d.txt", strSavePath.c_str(),
+						st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+					try
+					{
+						FILE *fp = NULL;
+						fopen_s(&fp, strFileName, "w");
+
+						for (int pos = 0; pos < m_arrNodesBuffer[sensorIdx].size(); pos++)
+						{
+							if (0.0 > m_arrNodesBuffer[sensorIdx][pos].first) { break; }
+							fprintf_s(fp, "%lf,%lf\n",
+								m_arrNodesBuffer[sensorIdx][pos].first,
+								m_arrNodesBuffer[sensorIdx][pos].second);
+						}
+
+						fclose(fp);
+					}
+					catch (int e)
+					{
+
+					}
+				}
+			}
 		}	
 	}
 
@@ -442,13 +728,26 @@ void CCaptureDatasetDlg::OnBnClickedCancel()
 		for (int camIdx = 0; camIdx < m_numMVCameras; camIdx++)
 		{
 			gCameraGrabbing[camIdx] = false;
-			WaitForSingleObject(m_hThread[camIdx], INFINITE);
-			CloseHandle(m_hThread[camIdx]);
+			WaitForSingleObject(m_hCameraThread[camIdx], INFINITE);
+			CloseHandle(m_hCameraThread[camIdx]);
 
 			if (NULL != stPCaptureParams[camIdx])
 			{
 				delete stPCaptureParams[camIdx];
 				stPCaptureParams[camIdx] = NULL;
+			}
+		}
+
+		for (int lidarIdx = 0; lidarIdx < m_numLidars; lidarIdx++)
+		{
+			gLidarGrabbing[lidarIdx] = false;
+			WaitForSingleObject(m_hLidarThread[lidarIdx], INFINITE);
+			CloseHandle(m_hLidarThread[lidarIdx]);
+
+			if (NULL != stPLidarParams[lidarIdx])
+			{
+				delete stPLidarParams[lidarIdx];
+				stPLidarParams[lidarIdx] = NULL;
 			}
 		}
 	}

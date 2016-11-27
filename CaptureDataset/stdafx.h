@@ -51,3 +51,5 @@
 #endif
 
 
+#include "rplidar.h" //RPLIDAR standard sdk, all-in-one header
+

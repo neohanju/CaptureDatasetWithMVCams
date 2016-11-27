@@ -114,12 +114,12 @@
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>_WINDOWS;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
-      <AdditionalIncludeDirectories>$(MVIMPACT_ACQUIRE_DIR);$(OPENCV_310)\build\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MVIMPACT_ACQUIRE_DIR);$(OPENCV_310)\build\include;$(ProjectDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalLibraryDirectories>$(MVIMPACT_ACQUIRE_DIR)\lib\win\x64;$(OPENCV_310)\build\x64\vc14\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>opencv_world310d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(MVIMPACT_ACQUIRE_DIR)\lib\win\x64;$(OPENCV_310)\build\x64\vc14\lib;$(ProjectDir)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>opencv_world310d.lib;rplidar_driver.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Midl>
       <MkTypLibCompatible>false</MkTypLibCompatible>
@@ -167,14 +167,14 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>_WINDOWS;NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
-      <AdditionalIncludeDirectories>$(MVIMPACT_ACQUIRE_DIR);$(OPENCV_310)\build\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(MVIMPACT_ACQUIRE_DIR);$(OPENCV_310)\build\include;$(ProjectDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalLibraryDirectories>$(MVIMPACT_ACQUIRE_DIR)\lib\win\x64;$(OPENCV_310)\build\x64\vc14\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>opencv_world310.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(MVIMPACT_ACQUIRE_DIR)\lib\win\x64;$(OPENCV_310)\build\x64\vc14\lib;$(ProjectDir)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>opencv_world310.lib;rplidar_driver.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Midl>
       <MkTypLibCompatible>false</MkTypLibCompatible>
@@ -193,6 +193,11 @@
   <ItemGroup>
     <ClInclude Include="CaptureDataset.h" />
     <ClInclude Include="CaptureDatasetDlg.h" />
+    <ClInclude Include="include\rplidar.h" />
+    <ClInclude Include="include\rplidar_cmd.h" />
+    <ClInclude Include="include\rplidar_driver.h" />
+    <ClInclude Include="include\rplidar_protocol.h" />
+    <ClInclude Include="include\rptypes.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="stdafx.h" />
     <ClInclude Include="targetver.h" />
